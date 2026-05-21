@@ -16,6 +16,10 @@
 #include "ggml-cuda.h"
 #endif
 
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+
 /* stb (implementation compiled here -- order is pinned) */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -3295,6 +3299,15 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
         }
     }
 #endif
+#ifdef GGML_USE_VULKAN
+    if (!model->backend && params.use_gpu) {
+        fprintf(stderr, "%s: using Vulkan backend\n", __func__);
+        model->backend = ggml_backend_vk_init(0);
+        if (!model->backend) {
+            fprintf(stderr, "%s: ggml_backend_vk_init(0) returned null; falling back\n", __func__);
+        }
+    }
+#endif
     if (!model->backend) {
         fprintf(stderr, "%s: using CPU backend\n", __func__);
         model->backend = ggml_backend_cpu_init();
@@ -3785,13 +3798,13 @@ static struct ggml_tensor* sam3_attn_ext(
 
 
 /*****************************************************************************
-** Windowed-attention partition / unpartition (CUDA-compatible variant)
+** Windowed-attention partition / unpartition (CUDA/Vulkan-compatible variant)
 **
 ** ggml's GGML_OP_WIN_PART / GGML_OP_WIN_UNPART only ship with CPU and Metal
-** backend implementations. When we build for CUDA, calling them aborts inside
-** ggml-cuda ("op not supported"). We sidestep the gap by expressing the same
-** op as a sequence of pad + reshape + permute + cont, all of which have CUDA
-** kernels.
+** backend implementations. When we build for CUDA or Vulkan, calling them
+** aborts inside the backend ("op not supported"). We sidestep the gap by
+** expressing the same op as a sequence of pad + reshape + permute + cont,
+** all of which the CUDA and Vulkan backends implement.
 **
 ** Forward (sam3_win_part): a[E, W, H, 1] → [E, w, w, npx*npy]
 **   1. Zero-pad W → W' = npx*w and H → H' = npy*w via ggml_pad.
@@ -3810,11 +3823,11 @@ static struct ggml_tensor* sam3_attn_ext(
 ** Reverse (sam3_win_unpart) just runs the inverse, finishing with a view
 ** crop back to (w0, h0) when padding was added.
 **
-** Gated by GGML_USE_CUDA so CPU/Metal builds keep using the native single-op
-** form (which is faster and saves graph nodes).
+** Gated by GGML_USE_CUDA / GGML_USE_VULKAN so CPU/Metal builds keep using the
+** native single-op form (which is faster and saves graph nodes).
 *****************************************************************************/
 
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN)
 
 static struct ggml_tensor* sam3_win_part(
     struct ggml_context* ctx,
@@ -3875,7 +3888,7 @@ static struct ggml_tensor* sam3_win_unpart(
     return ggml_cont(ctx, view);
 }
 
-#else  // !GGML_USE_CUDA — fall back to the native ggml ops (CPU/Metal both implement them).
+#else  // CPU/Metal — fall back to the native ggml ops (both backends implement them).
 
 static inline struct ggml_tensor* sam3_win_part(
     struct ggml_context* ctx, struct ggml_tensor* a, int w) {
@@ -3887,16 +3900,16 @@ static inline struct ggml_tensor* sam3_win_unpart(
     return ggml_win_unpart(ctx, a, w0, h0, w);
 }
 
-#endif  // GGML_USE_CUDA
+#endif  // GGML_USE_CUDA || GGML_USE_VULKAN
 
 
 /*****************************************************************************
-** Global mean along dim 0  (CUDA-compatible variant)
+** Global mean along dim 0  (CUDA/Vulkan-compatible variant)
 **
 ** Original sites use ggml_pool_1d(POOL_AVG, T, T, 0) — kernel == stride == T,
-** which is exactly a global average along dim 0. ggml-cuda doesn't ship a
-** POOL_1D kernel yet (only POOL_2D), so on CUDA builds we route through
-** ggml_mean instead, which is the canonical "mean along dim 0" op and is
+** which is exactly a global average along dim 0. Neither ggml-cuda nor
+** ggml-vulkan ship a POOL_1D kernel yet (only POOL_2D), so on those builds
+** we route through ggml_mean instead — the canonical "mean along dim 0" op,
 ** implemented on every backend.
 **
 ** NOTE for upstream: ggml_mean works on CPU and Metal too, so the #ifdef
@@ -3904,7 +3917,7 @@ static inline struct ggml_tensor* sam3_win_unpart(
 ** here so the maintainer can decide what they prefer to land.
 *****************************************************************************/
 
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN)
 
 static inline struct ggml_tensor* sam3_global_mean_dim0(
     struct ggml_context* ctx, struct ggml_tensor* a, int /*len_dim0*/) {
@@ -3918,7 +3931,7 @@ static inline struct ggml_tensor* sam3_global_mean_dim0(
     return ggml_pool_1d(ctx, a, GGML_OP_POOL_AVG, len_dim0, len_dim0, 0);
 }
 
-#endif  // GGML_USE_CUDA
+#endif  // GGML_USE_CUDA || GGML_USE_VULKAN
 
 
 // Single ViT block forward: pre-norm → attn (window or global, with RoPE) → residual → pre-norm → MLP → residual
