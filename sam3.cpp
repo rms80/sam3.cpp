@@ -12,6 +12,10 @@
 #include "ggml-metal.h"
 #endif
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 /* stb (implementation compiled here -- order is pinned) */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -3282,6 +3286,15 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
         model->backend = ggml_backend_metal_init();
     }
 #endif
+#ifdef GGML_USE_CUDA
+    if (!model->backend && params.use_gpu) {
+        fprintf(stderr, "%s: using CUDA backend\n", __func__);
+        model->backend = ggml_backend_cuda_init(0);
+        if (!model->backend) {
+            fprintf(stderr, "%s: ggml_backend_cuda_init(0) returned null; falling back\n", __func__);
+        }
+    }
+#endif
     if (!model->backend) {
         fprintf(stderr, "%s: using CPU backend\n", __func__);
         model->backend = ggml_backend_cpu_init();
@@ -3709,6 +3722,205 @@ static struct ggml_tensor* sam3_apply_rope(struct ggml_context* ctx,
     return ggml_reshape_3d(ctx, ggml_cont(ctx, out), head_dim, N, nheads_B);
 }
 
+/*****************************************************************************
+** Flash-attention wrapper with manual-SDPA fallback
+**
+** ggml-cuda's flash-attention kernels only implement a fixed set of head
+** dimensions (40, 64, 72, 80, 96, 112, 128, 256, 576 as of ggml master). SAM2's
+** mask decoder uses HD=32 (sam_embed_dim=256 / 8 heads), so calling
+** ggml_flash_attn_ext directly aborts inside ggml-cuda. Route every fattn call
+** through this wrapper instead — supported HDs go through the fast path, and
+** unsupported HDs fall back to a manual K^T·Q → softmax → V composition that
+** produces the same [HD, NH, N_q, B] output layout.
+*****************************************************************************/
+
+static inline bool sam3_fattn_hd_supported(int64_t hd) {
+    switch (hd) {
+        case 40: case 64: case 72: case 80: case 96:
+        case 112: case 128: case 256: case 576:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static struct ggml_tensor* sam3_attn_ext(
+    struct ggml_context* ctx,
+    struct ggml_tensor*  Q,            // [HD, N_q,  NH, B]
+    struct ggml_tensor*  K,            // [HD, N_kv, NH, B]
+    struct ggml_tensor*  V,            // [HD, N_kv, NH, B]  (may be permuted/non-contig)
+    struct ggml_tensor*  mask,         // nullable, F16 additive mask
+    float                scale,
+    float                max_bias,
+    float                logit_softcap)
+{
+    if (sam3_fattn_hd_supported(Q->ne[0])) {
+        return ggml_flash_attn_ext(ctx, Q, K, V, mask, scale, max_bias, logit_softcap);
+    }
+
+    // Manual path doesn't implement ALiBi / logit-softcap; every SAM2/SAM3 call
+    // site passes 0 for both, so just assert rather than emulate.
+    GGML_ASSERT(max_bias      == 0.0f && "sam3_attn_ext manual path: ALiBi not supported");
+    GGML_ASSERT(logit_softcap == 0.0f && "sam3_attn_ext manual path: logit_softcap not supported");
+
+    // ggml_mul_mat needs ne0 as the shared dim, and the V-permute below needs
+    // contiguous storage. Force a copy for permuted views.
+    auto* Kc = ggml_is_contiguous(K) ? K : ggml_cont(ctx, K);
+    auto* Vc = ggml_is_contiguous(V) ? V : ggml_cont(ctx, V);
+
+    // K^T·Q via ggml_mul_mat(K, Q): A^T·B with shared dim = ne0 = HD → [N_kv, N_q, NH, B].
+    auto* scores = ggml_mul_mat(ctx, Kc, Q);
+
+    // Fused scale + mask + softmax (matches the pattern at line ~8598).
+    scores = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
+
+    // V·softmax: want out[hd, q] = Σ_k V[hd, k] · scores[k, q].
+    // ggml_mul_mat(VT, scores) with VT=V^T [N_kv, HD] gives [HD, N_q].
+    auto* VT  = ggml_cont(ctx, ggml_permute(ctx, Vc, 1, 0, 2, 3));  // [N_kv, HD, NH, B]
+    auto* out = ggml_mul_mat(ctx, VT, scores);                       // [HD, N_q, NH, B]
+
+    // flash_attn_ext returns [HD, NH, N_q, B] — swap dims 1↔2 to match.
+    return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
+}
+
+
+/*****************************************************************************
+** Windowed-attention partition / unpartition (CUDA-compatible variant)
+**
+** ggml's GGML_OP_WIN_PART / GGML_OP_WIN_UNPART only ship with CPU and Metal
+** backend implementations. When we build for CUDA, calling them aborts inside
+** ggml-cuda ("op not supported"). We sidestep the gap by expressing the same
+** op as a sequence of pad + reshape + permute + cont, all of which have CUDA
+** kernels.
+**
+** Forward (sam3_win_part): a[E, W, H, 1] → [E, w, w, npx*npy]
+**   1. Zero-pad W → W' = npx*w and H → H' = npy*w via ggml_pad.
+**   2. Reinterpret [E, W', H', 1] as [E*w, npx, w, npy]. We merge E with the
+**      within-window x-axis to keep the whole thing 4D (ggml has no native
+**      5D reshape). The math:
+**         W' = w*npx, so dim-1 at position px*w + i1 lives at offset
+**         (px*w + i1) * E in the source. Splitting that across the new
+**         dims [E*w, npx] gives stride E for i1 (inside E*w) and stride
+**         E*w for px — exactly what reshape produces.
+**   3. Permute (0, 2, 1, 3) to put the two within-window axes adjacent.
+**   4. ggml_cont to materialize the non-contig permute, then reshape to
+**      [E, w, w, npx*npy]. The (npx, npy) → np merge follows row-major
+**      conventions, so np = py*npx + px — matching the native op.
+**
+** Reverse (sam3_win_unpart) just runs the inverse, finishing with a view
+** crop back to (w0, h0) when padding was added.
+**
+** Gated by GGML_USE_CUDA so CPU/Metal builds keep using the native single-op
+** form (which is faster and saves graph nodes).
+*****************************************************************************/
+
+#ifdef GGML_USE_CUDA
+
+static struct ggml_tensor* sam3_win_part(
+    struct ggml_context* ctx,
+    struct ggml_tensor*  a,            // [E, W, H, 1] F32
+    int                  w)
+{
+    GGML_ASSERT(a->ne[3] == 1);
+    GGML_ASSERT(a->type  == GGML_TYPE_F32);
+
+    const int64_t E   = a->ne[0];
+    const int64_t W   = a->ne[1];
+    const int64_t H   = a->ne[2];
+    const int64_t px  = (w - W % w) % w;
+    const int64_t py  = (w - H % w) % w;
+    const int64_t npx = (W + px) / w;
+    const int64_t npy = (H + py) / w;
+
+    struct ggml_tensor* p = (px == 0 && py == 0)
+        ? a
+        : ggml_pad(ctx, a, 0, (int)px, (int)py, 0);     // [E, W', H', 1]
+
+    p = ggml_reshape_4d(ctx, p, E * w, npx, w, npy);    // 4D split, see header
+    p = ggml_permute   (ctx, p, 0, 2, 1, 3);             // [E*w, w, npx, npy] non-contig
+    p = ggml_cont      (ctx, p);                          // materialize
+    p = ggml_reshape_4d(ctx, p, E, w, w, npx * npy);     // [E, w, w, np]
+    return p;
+}
+
+static struct ggml_tensor* sam3_win_unpart(
+    struct ggml_context* ctx,
+    struct ggml_tensor*  a,            // [E, w, w, npx*npy] F32
+    int                  w0,
+    int                  h0,
+    int                  w)
+{
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+
+    const int64_t E   = a->ne[0];
+    const int64_t px  = (w - w0 % w) % w;
+    const int64_t py  = (w - h0 % w) % w;
+    const int64_t Wp  = w0 + px;
+    const int64_t Hp  = h0 + py;
+    const int64_t npx = Wp / w;
+    const int64_t npy = Hp / w;
+    GGML_ASSERT(a->ne[3] == npx * npy);
+
+    auto* p = ggml_reshape_4d(ctx, a, E * w, w, npx, npy);  // split np → (npx, npy)
+    p = ggml_permute   (ctx, p, 0, 2, 1, 3);                 // [E*w, npx, w, npy]
+    p = ggml_cont      (ctx, p);
+    p = ggml_reshape_4d(ctx, p, E, Wp, Hp, 1);               // [E, W', H', 1]
+
+    if (px == 0 && py == 0) {
+        return p;
+    }
+    // Crop the zero-padded rows/cols added by win_part.
+    auto* view = ggml_view_4d(ctx, p, E, w0, h0, 1,
+                              p->nb[1], p->nb[2], p->nb[3], 0);
+    return ggml_cont(ctx, view);
+}
+
+#else  // !GGML_USE_CUDA — fall back to the native ggml ops (CPU/Metal both implement them).
+
+static inline struct ggml_tensor* sam3_win_part(
+    struct ggml_context* ctx, struct ggml_tensor* a, int w) {
+    return ggml_win_part(ctx, a, w);
+}
+
+static inline struct ggml_tensor* sam3_win_unpart(
+    struct ggml_context* ctx, struct ggml_tensor* a, int w0, int h0, int w) {
+    return ggml_win_unpart(ctx, a, w0, h0, w);
+}
+
+#endif  // GGML_USE_CUDA
+
+
+/*****************************************************************************
+** Global mean along dim 0  (CUDA-compatible variant)
+**
+** Original sites use ggml_pool_1d(POOL_AVG, T, T, 0) — kernel == stride == T,
+** which is exactly a global average along dim 0. ggml-cuda doesn't ship a
+** POOL_1D kernel yet (only POOL_2D), so on CUDA builds we route through
+** ggml_mean instead, which is the canonical "mean along dim 0" op and is
+** implemented on every backend.
+**
+** NOTE for upstream: ggml_mean works on CPU and Metal too, so the #ifdef
+** could be dropped and the pool_1d path retired entirely — keeping it gated
+** here so the maintainer can decide what they prefer to land.
+*****************************************************************************/
+
+#ifdef GGML_USE_CUDA
+
+static inline struct ggml_tensor* sam3_global_mean_dim0(
+    struct ggml_context* ctx, struct ggml_tensor* a, int /*len_dim0*/) {
+    return ggml_mean(ctx, a);
+}
+
+#else
+
+static inline struct ggml_tensor* sam3_global_mean_dim0(
+    struct ggml_context* ctx, struct ggml_tensor* a, int len_dim0) {
+    return ggml_pool_1d(ctx, a, GGML_OP_POOL_AVG, len_dim0, len_dim0, 0);
+}
+
+#endif  // GGML_USE_CUDA
+
+
 // Single ViT block forward: pre-norm → attn (window or global, with RoPE) → residual → pre-norm → MLP → residual
 // x: [E, W, H, B] in ggml layout (following sam.cpp convention)
 static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
@@ -3731,7 +3943,7 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
 
     if (!is_global) {
         // Window partition: [E, W, H, B] → [E, WS, WS, B*num_windows]
-        x = ggml_win_part(ctx, x, WS);
+        x = sam3_win_part(ctx, x, WS);
     }
 
     const int64_t W_cur = x->ne[1];
@@ -3775,7 +3987,7 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
         K = ggml_reshape_4d(ctx, K, HD, W_cur * H_cur, NH, B_cur);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* attn_out = sam3_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         // flash_attn_ext returns [HD, NH, N, B_cur] — HD and NH adjacent,
         // so reshaping directly to [E, W, H, B] is correct.
         x = ggml_reshape_4d(ctx, attn_out, E, W_cur, H_cur, B_cur);
@@ -3785,7 +3997,7 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
     }
 
     if (!is_global) {
-        x = ggml_win_unpart(ctx, x, w0, h0, WS);
+        x = sam3_win_unpart(ctx, x, w0, h0, WS);
     }
 
     x = ggml_add(ctx, shortcut, x);
@@ -3995,7 +4207,7 @@ static struct ggml_tensor* sam3_text_block_forward(struct ggml_context* ctx,
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous; flash_attn uses strides
 
     float scale = 1.0f / sqrtf((float)HD);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, causal_mask, scale, 0.0f, 0.0f);
+    auto* attn_out = sam3_attn_ext(ctx, Q, K, V, causal_mask, scale, 0.0f, 0.0f);
     x = ggml_reshape_2d(ctx, attn_out, E, L);
 
     x = ggml_mul_mat(ctx, blk.attn_out_proj_w, x);
@@ -4396,7 +4608,7 @@ static struct ggml_tensor* sam2_hiera_block_forward(struct ggml_context* ctx,
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous OK for flash_attn
 
     float scale = 1.0f / sqrtf((float)head_dim);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0, 0);
+    auto* attn_out = sam3_attn_ext(ctx, Q, K, V, nullptr, scale, 0, 0);
 
     // Recombine: flash_attn output is [HD, N_q, NH, B_win]
     // → reshape to [C_out, N_q, B_win]
@@ -5481,7 +5693,7 @@ static struct ggml_tensor* edgetam_perceiver_layer_forward(
         k = ggml_reshape_4d(ctx, k, D, N_x,   1, batch);
         v = ggml_reshape_4d(ctx, v, D, N_x,   1, batch);
 
-        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        auto* attn = sam3_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
         // Output: [D, 1, N_lat, batch] (permuted) → reshape to [D, N_lat, batch]
         attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
 
@@ -5519,7 +5731,7 @@ static struct ggml_tensor* edgetam_perceiver_layer_forward(
         k = ggml_reshape_4d(ctx, k, D, N_lat, 1, batch);
         v = ggml_reshape_4d(ctx, v, D, N_lat, 1, batch);
 
-        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        auto* attn = sam3_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
         attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
 
         auto* sa_out = ggml_mul_mat(ctx, layer.sa_out_w, attn);
@@ -6821,7 +7033,7 @@ static struct ggml_tensor * sam3_build_vit_attn_core_from_qkv(struct ggml_contex
     K = ggml_reshape_4d(ctx, K, HD, W_cur * H_cur, NH, B_cur);
 
     const float scale = 1.0f / sqrtf((float) HD);
-    struct ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    struct ggml_tensor * attn_out = sam3_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
 
     return ggml_cont(ctx, ggml_reshape_4d(ctx, attn_out, E, W_cur, H_cur, B_cur));
 }
@@ -6836,7 +7048,7 @@ static struct ggml_tensor * sam3_build_vit_block_stage_from_input(struct ggml_co
             return sam3_layer_norm(ctx, input, blk.norm1_w, blk.norm1_b);
 
         case SAM3_VIT_BLOCK_STAGE_WINDOW_PART:
-            return ggml_win_part(ctx, input, hp.vit_window_size);
+            return sam3_win_part(ctx, input, hp.vit_window_size);
 
         case SAM3_VIT_BLOCK_STAGE_QKV_PROJ:
             return ggml_add(ctx, ggml_mul_mat(ctx, blk.qkv_w, input), blk.qkv_b);
@@ -6848,7 +7060,7 @@ static struct ggml_tensor * sam3_build_vit_block_stage_from_input(struct ggml_co
             return ggml_add(ctx, ggml_mul_mat(ctx, blk.proj_w, input), blk.proj_b);
 
         case SAM3_VIT_BLOCK_STAGE_WINDOW_UNPART:
-            return ggml_win_unpart(ctx, input, hp.n_img_embd(), hp.n_img_embd(), hp.vit_window_size);
+            return sam3_win_unpart(ctx, input, hp.n_img_embd(), hp.n_img_embd(), hp.vit_window_size);
 
         case SAM3_VIT_BLOCK_STAGE_NORM2:
             return sam3_layer_norm(ctx, input, blk.norm2_w, blk.norm2_b);
@@ -7538,7 +7750,7 @@ static struct ggml_tensor* sam3_multihead_attn_fused(
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N_kv, NH, B] non-contiguous; flash_attn uses strides
 
     float scale = 1.0f / sqrtf((float)HD);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask, scale, 0.0f, 0.0f);
+    auto* attn_out = sam3_attn_ext(ctx, Q, K, V, attn_mask, scale, 0.0f, 0.0f);
 
     auto* merged = ggml_reshape_3d(ctx, attn_out, D, N_q, B);
     merged = ggml_mul_mat(ctx, out_proj_w, merged);
@@ -7721,7 +7933,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, S, 1);
 
             sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -7763,7 +7975,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, S_q, 1);
 
             ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -8071,7 +8283,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
 
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -8113,7 +8325,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
 
         auto* ca_mask = sam3_expand_token_attn_bias(ctx, prompt_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, ca_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_attn_ext(ctx, Q, K, V, ca_mask, scale, 0.0f, 0.0f);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
 
         ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -8489,7 +8701,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
         sa_out = ggml_add(ctx, sa_out, ly.sa_out_proj_b);
@@ -8532,7 +8744,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
 
         auto* text_mask = sam3_expand_token_attn_bias(ctx, text_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, text_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_attn_ext(ctx, Q, K, V, text_mask, scale, 0.0f, 0.0f);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
         ca_out = ggml_mul_mat(ctx, ly.ca_text_out_w, ca_out);
         ca_out = ggml_add(ctx, ca_out, ly.ca_text_out_b);
@@ -8588,7 +8800,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
             ca_out = ggml_mul_mat(ctx, v_t, kq);                 // [HD, N_q, NH, B]
             ca_out = ggml_cont(ctx, ggml_permute(ctx, ca_out, 0, 2, 1, 3));
         } else {
-            ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            ca_out = sam3_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         }
 
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
@@ -8666,31 +8878,17 @@ static struct ggml_tensor* sam3_dot_product_scoring(
 
     // Step 2: Mean-pool over valid text tokens → [D, 1, B]
     // Python: pooled = (prompt * is_valid).sum(0) / num_valid
+    // The masked path bakes T/n_valid into the mask values for valid tokens (0 for
+    // padding), so mean(mask * features) = sum(valid * T/n_valid) / T = sum(valid)/n_valid.
     struct ggml_tensor* text_pooled;
     if (text_valid_mask) {
-        // Permute to [T, D, B] for masked pooling
         auto* tp = ggml_cont(ctx, ggml_permute(ctx, text_mlp, 1, 0, 2, 3));  // [T, D, B]
-        // Mask: text_valid_mask is [T, 1, B] — broadcast multiply zeros out padding
-        tp = ggml_mul(ctx, tp, text_valid_mask);  // [T, D, B] with padding zeroed
-        // Sum over T dimension: pool_1d with SUM kernel=T
-        // ggml_pool_1d AVG divides by T; we want SUM then divide by n_valid.
-        // Use AVG and then scale by T/n_valid? Or use a manual approach.
-        // Simpler: sum via pool_1d with AVG, then scale by T/n_valid.
-        // But n_valid is dynamic. Instead: sum = mean * T, then divide by n_valid.
-        // We pass n_valid as part of the mask: text_valid_mask sums to n_valid.
-        // pool_1d(masked, AVG, T, T, 0) = sum(masked) / T. Multiply by T → sum(masked).
-        // Then divide by n_valid. But n_valid is a scalar we know CPU-side.
-        // For simplicity: compute AVG over ALL T positions (with padding zeroed out).
-        // This gives sum(valid) / T. To get sum(valid) / n_valid, scale by T / n_valid.
-        // We embed the scale factor into the mask: mask = (T / n_valid) for valid, 0 for pad.
-        // Then AVG(mask * features) = sum(valid * T/n_valid) / T = sum(valid) / n_valid. ✓
-        // Caller should set mask values to T/n_valid for valid tokens, 0 for padding.
-        auto* pooled_t = ggml_pool_1d(ctx, tp, GGML_OP_POOL_AVG, (int)T, (int)T, 0);
+        tp = ggml_mul(ctx, tp, text_valid_mask);                              // padding zeroed (scale baked in)
+        auto* pooled_t = sam3_global_mean_dim0(ctx, tp, (int)T);              // [1, D, B]
         text_pooled = ggml_cont(ctx, ggml_permute(ctx, pooled_t, 1, 0, 2, 3));  // [D, 1, B]
     } else {
-        // All tokens valid — simple mean
         auto* tp = ggml_cont(ctx, ggml_permute(ctx, text_mlp, 1, 0, 2, 3));
-        auto* pooled_t = ggml_pool_1d(ctx, tp, GGML_OP_POOL_AVG, (int)T, (int)T, 0);
+        auto* pooled_t = sam3_global_mean_dim0(ctx, tp, (int)T);
         text_pooled = ggml_cont(ctx, ggml_permute(ctx, pooled_t, 1, 0, 2, 3));
     }
     ggml_set_name(text_pooled, "scoring_pooled");
@@ -9268,7 +9466,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* sa_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, N, 1);
             sa_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.sa_out_w, sa_out), ly.sa_out_b);
             x = ggml_add(ctx, x, sa_out);
@@ -9313,7 +9511,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* ca_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, N, 1);
             ca_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.ca_out_w, ca_out), ly.ca_out_b);
             x = ggml_add(ctx, x, ca_out);
@@ -10207,7 +10405,7 @@ static struct ggml_tensor* sam3_sam_attention(
 
     // Attention
     float scale = 1.0f / sqrtf((float)HD);
-    auto* out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    auto* out = sam3_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
     // out: [HD, NH, N_q, B] (flash_attn_ext swaps dims 1,2 vs input)
 
 #if 0  // Manual SDPA (for debugging only)
