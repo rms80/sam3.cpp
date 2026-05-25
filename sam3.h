@@ -263,6 +263,29 @@ int sam3_tracker_add_instance(sam3_tracker         & tracker,
                               const sam3_model      & model,
                               const sam3_pvs_params & pvs_params);
 
+/*
+** Add a new instance to the tracker from an existing binary mask on the
+** current frame, bypassing the PVS prompt encoder / mask decoder.  The image
+** must already be encoded (via sam3_track_frame, sam3_propagate_frame, or
+** sam3_encode_image).  The mask (0/255, any resolution) is resampled to the
+** tracker's memory resolution and written straight into the memory bank as a
+** conditioning frame, so propagation tracks exactly the supplied mask rather
+** than a mask re-derived from points/box.
+**
+** No SAM decoder token is produced on this path, so the instance's object
+** pointer is seeded from the model's learned no_obj_ptr embedding (the same
+** convention used by the PCS conditioning path) instead of a decoded token;
+** tracking still propagates from the mask memory.  obj_score is the confidence
+** stored for the seed frame (1.0 = fully trusted user mask).
+**
+** Returns the assigned instance_id, or -1 on failure (empty mask).
+*/
+int sam3_tracker_add_instance_from_mask(sam3_tracker     & tracker,
+                                        sam3_state       & state,
+                                        const sam3_model & model,
+                                        const sam3_mask  & mask,
+                                        float              obj_score = 1.0f);
+
 /* Return the current frame index of the tracker. */
 int  sam3_tracker_frame_index(const sam3_tracker & tracker);
 

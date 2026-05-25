@@ -12298,6 +12298,75 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
     return inst_id;
 }
 
+int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state,
+                                        const sam3_model& model,
+                                        const sam3_mask& mask, float obj_score) {
+    const int D = model.hparams.neck_dim;
+    const int mask_hw = sam3_eff_feat_size(state, model.hparams) * 4;
+
+    if (mask.data.empty() || mask.width <= 0 || mask.height <= 0) {
+        fprintf(stderr, "%s: input mask is empty\n", __func__);
+        return -1;
+    }
+    if ((int)mask.data.size() < mask.width * mask.height) {
+        fprintf(stderr, "%s: mask data (%zu) smaller than %dx%d\n",
+                __func__, mask.data.size(), mask.width, mask.height);
+        return -1;
+    }
+
+    int inst_id = tracker.next_inst_id++;
+    // tracker.frame_index points to the *next* frame to process; the instance
+    // is being added on the frame that was just encoded.
+    int fi = tracker.frame_index - 1;
+    if (fi < 0) fi = 0;
+
+    // Resample the supplied binary mask to the memory resolution and turn it
+    // into synthetic logits. sam3_encode_memory applies sigmoid then scale/bias,
+    // so +6/-6 gives sigmoid ~0.9975/~0.0025 — practically identical to real
+    // mask-decoder logits. (Same scheme as sam3_tracker_add_instance.)
+    std::vector<float> synth_logits(mask_hw * mask_hw);
+    {
+        int mw = mask.width, mh = mask.height;
+        for (int y = 0; y < mask_hw; ++y) {
+            int sy = y * mh / mask_hw;
+            for (int x = 0; x < mask_hw; ++x) {
+                int sx = x * mw / mask_hw;
+                synth_logits[y * mask_hw + x] =
+                    (mask.data[sy * mw + sx] > 127) ? 6.0f : -6.0f;
+            }
+        }
+    }
+
+    // Encode into the memory bank as a conditioning frame.
+    if (!sam3_encode_memory(tracker, state, model, inst_id,
+                            synth_logits.data(), mask_hw, mask_hw,
+                            fi, true, obj_score)) {
+        fprintf(stderr, "%s: failed to encode memory for instance %d\n", __func__, inst_id);
+        return -1;
+    }
+
+    // No SAM decoder token exists when seeding from a raw mask, so seed the
+    // object pointer from the model's learned no_obj_ptr embedding (same
+    // convention as the PCS conditioning path). no_obj_ptr is stored as F32.
+    std::vector<float> obj_ptr(D);
+    ggml_backend_tensor_get(model.no_obj_ptr, obj_ptr.data(), 0, D * sizeof(float));
+    sam3_store_obj_ptr(tracker, model, inst_id, obj_ptr.data(), fi);
+
+    // Create confirmed masklet
+    sam3_masklet ml;
+    ml.instance_id = inst_id;
+    ml.first_frame = fi;
+    ml.last_seen = fi;
+    ml.last_score = obj_score;
+    ml.confirmed = true;
+    ml.mds_sum = 1;
+    tracker.masklets.push_back(std::move(ml));
+
+    SAM3_LOG(2, "%s: added instance #%d from mask (obj_score=%.3f)\n",
+             __func__, inst_id, obj_score);
+    return inst_id;
+}
+
 int sam3_tracker_frame_index(const sam3_tracker& tracker) { return tracker.frame_index; }
 
 void sam3_tracker_reset(sam3_tracker& tracker) {

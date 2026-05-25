@@ -299,6 +299,18 @@ for (int f = 1; f < n_frames; f++) {
 }
 ```
 
+```cpp
+// Seed a tracked instance from an existing mask instead of points/box.
+// The mask is written straight into the memory bank, so propagation tracks
+// exactly the supplied mask (e.g. one produced by an earlier PVS/PCS call,
+// or an external segmentation).
+auto tracker = sam3_create_visual_tracker(*model, {});
+sam3_encode_image(*state, *model, frame0);
+sam3_mask seed = /* 0/255 binary mask, any resolution */;
+sam3_tracker_add_instance_from_mask(*tracker, *state, *model, seed);
+// then sam3_propagate_frame(...) on subsequent frames as above
+```
+
 ### Quantization
 
 Convert F32/F16 weights to smaller quantized formats:
