@@ -12345,11 +12345,41 @@ int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state
         return -1;
     }
 
-    // No SAM decoder token exists when seeding from a raw mask, so seed the
-    // object pointer from the model's learned no_obj_ptr embedding (same
-    // convention as the PCS conditioning path). no_obj_ptr is stored as F32.
+    // Seed the object pointer.  There is no PVS decode here that would yield a
+    // SAM token (as the box/point path gets), but we have just written a
+    // conditioning frame into the memory bank — so run one propagation decode
+    // against that memory (with an empty pointer bank) to obtain a real SAM
+    // token, exactly the way every subsequent tracked frame produces its
+    // object pointer.  Seeding the learned no_obj_ptr instead (an "object
+    // absent" appearance prior) starves memory attention of any localization
+    // cue: the decoder then leans entirely on the pinned spatial conditioning
+    // memory and reproduces the seed mask every frame (masks clamped to the
+    // input mask).
     std::vector<float> obj_ptr(D);
-    ggml_backend_tensor_get(model.no_obj_ptr, obj_ptr.data(), 0, D * sizeof(float));
+    bool seeded_ptr = false;
+    {
+        auto mb = tracker.mem_banks.find(inst_id);
+        if (mb != tracker.mem_banks.end() && !mb->second.empty()) {
+            // sam3_propagate_single reads no masklet fields; a default probe is fine.
+            const std::vector<std::pair<int, struct ggml_tensor*>> empty_ptr_bank;
+            sam3_masklet probe;
+            probe.instance_id = inst_id;
+            sam3_prop_output seed = sam3_propagate_single(
+                tracker, state, model, probe, mb->second, empty_ptr_bank);
+            if ((int)seed.sam_token.size() == D) {
+                // seed.obj_score is the raw presence logit (thresholded at 0
+                // inside sam3_extract_obj_ptr_cpu), matching the propagate path.
+                sam3_extract_obj_ptr_cpu(model, seed.sam_token.data(),
+                                         seed.obj_score, obj_ptr.data());
+                seeded_ptr = true;
+            }
+        }
+    }
+    if (!seeded_ptr) {
+        // Fallback: learned no_obj_ptr (F32) if the seed decode failed.
+        fprintf(stderr, "%s: seed decode failed, falling back to no_obj_ptr\n", __func__);
+        ggml_backend_tensor_get(model.no_obj_ptr, obj_ptr.data(), 0, D * sizeof(float));
+    }
     sam3_store_obj_ptr(tracker, model, inst_id, obj_ptr.data(), fi);
 
     // Create confirmed masklet

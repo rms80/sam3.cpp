@@ -272,11 +272,12 @@ int sam3_tracker_add_instance(sam3_tracker         & tracker,
 ** conditioning frame, so propagation tracks exactly the supplied mask rather
 ** than a mask re-derived from points/box.
 **
-** No SAM decoder token is produced on this path, so the instance's object
-** pointer is seeded from the model's learned no_obj_ptr embedding (the same
-** convention used by the PCS conditioning path) instead of a decoded token;
-** tracking still propagates from the mask memory.  obj_score is the confidence
-** stored for the seed frame (1.0 = fully trusted user mask).
+** The prompt path produces no SAM decoder token, so the object pointer is
+** instead obtained by running one propagation decode against the just-written
+** conditioning memory (the same SAM token every tracked frame yields) and
+** projecting it; this gives propagation a real appearance cue to re-localize
+** with.  obj_score is the confidence stored for the seed frame (1.0 = fully
+** trusted user mask).
 **
 ** Returns the assigned instance_id, or -1 on failure (empty mask).
 */
