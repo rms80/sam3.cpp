@@ -30,12 +30,17 @@ if(APPLE AND SAM3_METAL AND NOT SAM3_USE_EXTERNAL_GGML)
 endif()
 
 if(SAM3_USE_EXTERNAL_GGML)
-    # find_package picks up the ggmlConfig.cmake from the install prefix the
-    # caller pointed `ggml_DIR` (or CMAKE_PREFIX_PATH) at. Provides the `ggml`
-    # IMPORTED target with includes + the appropriate import lib.
+    # find_package picks up the ggml-config.cmake from the install prefix the
+    # caller pointed `ggml_DIR` (or CMAKE_PREFIX_PATH) at. Provides namespaced
+    # IMPORTED targets — ggml::ggml (umbrella) and ggml::ggml-base.
     find_package(ggml CONFIG REQUIRED)
+    # The bundled path defines a plain `ggml` target via add_subdirectory; the
+    # external path defines `ggml::ggml`. Pick whichever exists so the
+    # target_link_libraries below works in both cases.
+    set(SAM3_GGML_TARGET ggml::ggml)
 else()
     add_subdirectory(ggml)
+    set(SAM3_GGML_TARGET ggml)
 endif()
 
 # sam3 library — honor BUILD_SHARED_LIBS so the downstream CMake can ask for
@@ -46,7 +51,16 @@ target_include_directories(sam3 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/stb
 )
-target_link_libraries(sam3 PUBLIC ggml)
+# Workaround: ggml-config.cmake (when ggml is configured with GGML_BACKEND_DL=ON)
+# creates ggml::ggml / ggml::ggml-base IMPORTED targets but never attaches
+# INTERFACE_INCLUDE_DIRECTORIES to them — the include-dir attach lives inside a
+# per-backend foreach that the BACKEND_DL branch skips entirely. Without this
+# patch, sam3.cpp's `#include <ggml.h>` doesn't resolve. Add the include dir
+# manually using the GGML_INCLUDE_DIR variable that ggml-config.cmake does set.
+if(SAM3_USE_EXTERNAL_GGML AND DEFINED GGML_INCLUDE_DIR)
+    target_include_directories(sam3 PUBLIC ${GGML_INCLUDE_DIR})
+endif()
+target_link_libraries(sam3 PUBLIC ${SAM3_GGML_TARGET})
 target_compile_features(sam3 PUBLIC cxx_std_14)
 
 # Public-visibility position-independent code so static libs can still be
