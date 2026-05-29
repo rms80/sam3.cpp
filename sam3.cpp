@@ -1024,10 +1024,61 @@ static bool sam3_copy_tensor_to_f32(struct ggml_tensor * t,
 ** Internal Helper Implementations
 *****************************************************************************/
 
-static bool sam3_graph_compute(ggml_backend_t backend, struct ggml_cgraph* graph, int n_threads) {
-    if (ggml_backend_is_cpu(backend)) {
-        ggml_backend_cpu_set_n_threads(backend, n_threads);
+// Set the backend's thread count via the runtime registry. Replaces the direct
+// `ggml_backend_is_cpu` + `ggml_backend_cpu_set_n_threads` pair: those symbols
+// are not link-time available when ggml is built with GGML_BACKEND_DL=ON
+// (backends are MODULE libs with no import library, reachable only through the
+// registry). For backends that don't expose set_n_threads (CUDA, Vulkan, Metal)
+// this is a silent no-op — matching the previous `if (is_cpu)` guard.
+static void sam3_backend_set_n_threads(ggml_backend_t backend, int n_threads) {
+    if (!backend) {
+        return;
     }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (!dev) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return;
+    }
+    auto fn = (ggml_backend_set_n_threads_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (fn) {
+        fn(backend, n_threads);
+    }
+}
+
+// Initialise a backend via the runtime registry: prefer GPU when use_gpu is
+// set, fall back to CPU. Works with both GGML_BACKEND_DL=ON shared-DLL builds
+// and statically-linked ggml builds — `ggml_backend_load_all()` is a no-op in
+// the latter and a one-shot discovery scan in the former.
+static ggml_backend_t sam3_backend_init(bool use_gpu) {
+    ggml_backend_load_all();
+    if (use_gpu) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (dev) {
+            fprintf(stderr, "%s: using %s backend\n", __func__, ggml_backend_dev_name(dev));
+            ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
+            if (b) {
+                return b;
+            }
+            fprintf(stderr, "%s: GPU backend init failed; falling back to CPU\n", __func__);
+        } else {
+            fprintf(stderr, "%s: no GPU backend registered; falling back to CPU\n", __func__);
+        }
+    }
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        fprintf(stderr, "%s: no CPU backend registered\n", __func__);
+        return nullptr;
+    }
+    fprintf(stderr, "%s: using CPU backend\n", __func__);
+    return ggml_backend_dev_init(cpu_dev, nullptr);
+}
+
+static bool sam3_graph_compute(ggml_backend_t backend, struct ggml_cgraph* graph, int n_threads) {
+    sam3_backend_set_n_threads(backend, n_threads);
     const enum ggml_status status = ggml_backend_graph_compute(backend, graph);
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed: %s\n",
@@ -3284,34 +3335,12 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     }
 
     // ── Init backend ─────────────────────────────────────────────────────
-#ifdef GGML_USE_METAL
-    if (params.use_gpu) {
-        fprintf(stderr, "%s: using Metal backend\n", __func__);
-        model->backend = ggml_backend_metal_init();
-    }
-#endif
-#ifdef GGML_USE_CUDA
-    if (!model->backend && params.use_gpu) {
-        fprintf(stderr, "%s: using CUDA backend\n", __func__);
-        model->backend = ggml_backend_cuda_init(0);
-        if (!model->backend) {
-            fprintf(stderr, "%s: ggml_backend_cuda_init(0) returned null; falling back\n", __func__);
-        }
-    }
-#endif
-#ifdef GGML_USE_VULKAN
-    if (!model->backend && params.use_gpu) {
-        fprintf(stderr, "%s: using Vulkan backend\n", __func__);
-        model->backend = ggml_backend_vk_init(0);
-        if (!model->backend) {
-            fprintf(stderr, "%s: ggml_backend_vk_init(0) returned null; falling back\n", __func__);
-        }
-    }
-#endif
-    if (!model->backend) {
-        fprintf(stderr, "%s: using CPU backend\n", __func__);
-        model->backend = ggml_backend_cpu_init();
-    }
+    // Backend discovery goes through ggml's runtime registry (see
+    // sam3_backend_init). Direct `ggml_backend_*_init()` calls don't link
+    // against a GGML_BACKEND_DL build because each backend is a CMake MODULE
+    // library — DLL exists, no import library — reachable only via the
+    // registry's `ggml_backend_dev_init`.
+    model->backend = sam3_backend_init(params.use_gpu);
     if (!model->backend) {
         fprintf(stderr, "%s: failed to init backend\n", __func__);
         return nullptr;
@@ -6163,9 +6192,7 @@ static bool sam2_encode_image_hiera(sam3_state& state,
     }
 
     // Compute
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, state.n_threads);
-    }
+    sam3_backend_set_n_threads(model.backend, state.n_threads);
     if (ggml_backend_graph_compute(model.backend, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
         ggml_gallocr_free(galloc);
@@ -7419,8 +7446,7 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
             }
         }
 
-        if (ggml_backend_is_cpu(model.backend))
-            ggml_backend_cpu_set_n_threads(model.backend, state.n_threads);
+        sam3_backend_set_n_threads(model.backend, state.n_threads);
         if (ggml_backend_graph_compute(model.backend, graph) != GGML_STATUS_SUCCESS) {
             ggml_gallocr_free(galloc);
             ggml_free(ctx0);
