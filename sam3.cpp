@@ -3492,6 +3492,15 @@ void sam3_free_state(sam3_state& state) {
     }
 }
 
+// Cross-DLL allocator pairing (see sam3.h for the full rationale): move-assign
+// each inner std::vector to a fresh empty one. Move-assign calls into this TU's
+// std::vector::operator= which runs the old buffer's deallocate via the DLL's
+// CRT — matching how it was originally allocated. The resulting empty vectors
+// leave ~sam3_result a no-op when it eventually fires on the caller side.
+void sam3_free_result(sam3_result& result) noexcept {
+    result.detections = std::vector<sam3_detection>();
+}
+
 /*****************************************************************************
 ** Image preprocessing
 *****************************************************************************/

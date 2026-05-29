@@ -261,6 +261,18 @@ SAM3_API sam3_result sam3_segment_pvs(sam3_state             & state,
                              const sam3_model       & model,
                              const sam3_pvs_params  & params);
 
+/* Cross-DLL allocator pairing: drain a sam3_result's vectors inside the DLL
+** that allocated them. When sam3 is built as a shared library and the caller
+** lives in a different module (e.g. an Unreal Engine plugin that overrides
+** global ::operator new/delete), letting ~sam3_result fire on the caller
+** side inlines std::vector<>::~vector() into the caller's TU and routes
+** ::operator delete[] through the caller's allocator — which doesn't
+** recognize blocks created here. Symptom: a heap-canary fatal in the host
+** allocator (e.g. UE's FMallocBinned2 "Attempt to realloc an unrecognized
+** block"). Call this immediately after extracting data; the result is left
+** valid-but-empty so the caller's eventual ~sam3_result is a no-op. */
+SAM3_API void sam3_free_result(sam3_result & result) noexcept;
+
 /*
 ** ── Video Tracking ──────────────────────────────────────────────────────
 */
